@@ -744,6 +744,19 @@
          (filter (fn [^Datom d] (pred (.-v d))) eavt)                         ;; _ _ v 
          (filter (fn [^Datom d] (= tx (datom-tx d))) eavt)                    ;; _ _ _ tx
          eavt])))                                                             ;; _ _ _ _
+  #_(-batch-search [db tuples]
+    (let [exemplar (first tuples)
+          bound (boundedness exemplar)]))
+  #_(-multi-select-datoms-ordered [db [index-name tuples]]
+    (let [;; comment
+          ;; This is the multi-slice. It assumes the tuples are already
+          ;; prepared for the range query.
+          ;; All call sites will need to know how to pad
+          ;; with emax, tmax, and nil.
+          ;; Also need to make sure eva doesn't hardcode an index
+          ;; that doesn't exist in datascript
+          ]
+      ))
 
   IIndexAccess
   (-datoms [db index c0 c1 c2 c3]
@@ -1175,6 +1188,35 @@
         (not (is-attr? db attr :db/unique))
           (raise "Lookup ref attribute should be marked as :db/unique: " eid
             {:error :lookup-ref/unique, :entity-id eid})
+        (nil? value)
+          nil
+        :else
+          (-> (-datoms db :avet attr value nil nil) first :e)))
+    
+    #?@(:cljs [(array? eid) (recur db (array-seq eid))])
+    
+    (keyword? eid)
+    (-> (-datoms db :avet :db/ident eid nil nil) first :e)
+
+    :else
+    (raise "Expected number or lookup ref for entity id, got " eid
+           {:error :entity-id/syntax, :entity-id eid})))
+
+(defn+ ^number entid-loose [db eid]
+  {:pre [(db? db)]}
+  (cond
+    (and (number? eid) (pos? eid))
+    (if (> eid emax)
+      (raise "Highest supported entity id is " emax ", got " eid {:error :entity-id :value eid})
+      eid)
+    
+    (sequential? eid)
+    (let [[attr value] eid]
+      (cond
+        (not= (count eid) 2)
+          eid
+        (not (is-attr? db attr :db/unique))
+          eid
         (nil? value)
           nil
         :else

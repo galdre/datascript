@@ -93,6 +93,10 @@
                   [?e :age ?a]]
       @*db100k)))
 
+;; with changes:
+;; 2.129
+;; without changes:
+;; 2.24
 (defn bench-q3 []
   (bench/bench
     (d/q '[:find ?e ?a
@@ -101,7 +105,17 @@
                   [?e :sex :male]]
       @*db100k)))
 
-(defn bench-q4 []
+;; with changes: (avg 40 runs: 3.124)
+;; 3.09
+;; 3.14
+;; 3.04
+;; 3.06
+;; 
+;; without changes:
+;; 3.22
+;; 3.25
+;; 3.23
+(defn bench-q4 [] ;; (avg 40 runs: 3.164)
   (bench/bench
     (d/q '[:find ?e ?l ?a
            :where [?e :name "Ivan"]
@@ -109,6 +123,12 @@
                   [?e :age ?a]
                   [?e :sex :male]]
       @*db100k)))
+
+(comment
+  (let [avg (fn [xs] (/ (reduce + xs) (count xs)))]
+    (avg (map :mean-ms (for [_ (range 40)] (bench-q4)))))
+
+  )
 
 (defn bench-qpred1 []
   (bench/bench
@@ -192,9 +212,17 @@
   (let [db (long-db 30 3)]
     (bench/bench (bench-rules db))))
 
+;; new: 12.85, 12.94
+;; old: 13.42, avg 40; 13.8, avg 40
 (defn bench-rules-long-30x5 []
   (let [db (long-db 30 5)]
     (bench/bench (bench-rules db))))
+
+(comment
+  (let [avg (fn [xs] (/ (reduce + xs) (count xs)))]
+    (avg (map :mean-ms (for [_ (range 40)] (bench-rules-long-30x5)))))
+
+  )
 
 (def *serialize-db 
   (delay
