@@ -397,6 +397,19 @@
                             (into {}))]
     (Relation. attr->prop datoms)))
 
+(defn ->fill-pattern
+  [attrs-rel pattern]
+  (let [common-attrs (into [] (filter #(contains? attrs-rel %)) pattern)
+        k->getter-fn (zipmap common-attrs (map #(getter-fn attrs-rel %) common-attrs))]
+    (fn [tuple]
+      (into []
+            (map
+             (fn [x]
+               (if-let [getter-fn (k->getter-fn x)]
+                 (getter-fn tuple)
+                 x)))
+            pattern))))
+
 (defn lookup-pattern-with-rel-db [db rel pattern]
   (let [tuples (:tuples rel)]
     (if (empty? tuples)
@@ -406,23 +419,20 @@
             tuple-get (if (.isArray (.getClass ^Object exemplar))
                         (fn [tuple idx] (aget ^objects tuple idx))
                         (fn [tuple idx] (get tuple idx)))
-            fill-pattern (fn [tuple]
-                           (into [] (comp
-                                     (map (fn [x]
-                                            (if-let [idx (get attrs-rel x)]
-                                              (resolve-value (tuple-get tuple idx))
-                                              x)))
-                                     (map #(if (or (= % '_) (free-var? %)) nil %)))
-                                 pattern))
+            fill-pattern (->fill-pattern attrs-rel pattern)
+            fallback-pattern (mapv #(if (or (= % '_) (free-var? %)) nil %) pattern)
+            exemplar-pattern (->> (fill-pattern exemplar)
+                                  (mapv #(if (or (= % '_) (free-var? %)) nil %)))
             ;; note: use pattern:
             attr->prop (->> (map vector pattern ["e" "a" "v" "tx"])
                             (filter (fn [[s _]] (free-var? s)))
                             (into {}))
-            tuple-search (fn [tuple]
-                           (let [search-pattern (fill-pattern tuple)]
-                             (db/-search db search-pattern)))
-            datoms (mapcat tuple-search tuples)]
-        (Relation. attr->prop datoms)))))
+            filled-tuples (into [] (comp (map fill-pattern) (distinct)) tuples)]
+        (if (<= (count filled-tuples) 5)
+            (let [res (db/-batch-search db exemplar-pattern fallback-pattern filled-tuples)]
+              (Relation. attr->prop res))
+            (lookup-pattern-db db pattern))
+        #_(Relation. attr->prop datoms)))))
 
 (defn choose-best-rel
   [rels pattern]
@@ -833,7 +843,7 @@
        (assoc context' :rels [negation]))
 
      '[*] ;; pattern
-     #_(let [rels (:rels context)
+     (let [rels (:rels context)
            source *implicit-source*
            pattern (resolve-pattern-lookup-refs source clause)]
 
@@ -845,17 +855,17 @@
              (if-not chosen-rel
                (let [relation (lookup-pattern source pattern)]
                  (update context :rels conj relation))
-               (let [relation (lookup-pattern-with-rel-db source chosen-rel pattern)]
-                 (binding [*lookup-attrs* (if (satisfies? db/IDB source)
-                                            (dynamic-lookup-attrs source pattern)
-                                            *lookup-attrs*)]
+               (binding [*lookup-attrs* (if (satisfies? db/IDB source)
+                                          (dynamic-lookup-attrs source pattern)
+                                          *lookup-attrs*)]
+                 (let [relation (lookup-pattern-with-rel-db source chosen-rel pattern)]
                    (update context :rels collapse-rels relation))))))
          (let [relation (lookup-pattern source pattern)]
            (binding [*lookup-attrs* (if (satisfies? db/IDB source)
                                       (dynamic-lookup-attrs source pattern)
                                       *lookup-attrs*)]
              (update context :rels collapse-rels relation)))))
-     (let [source   *implicit-source*
+     #_(let [source   *implicit-source*
              pattern  (resolve-pattern-lookup-refs source clause)
              relation (lookup-pattern source pattern)]
          (binding [*lookup-attrs* (if (satisfies? db/IDB source)

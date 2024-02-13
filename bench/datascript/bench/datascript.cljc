@@ -10,7 +10,11 @@
   {:id      {:db/unique :db.unique/identity}
    :follows {:db/valueType   :db.type/ref
              :db/cardinality :db.cardinality/many}
-   :alias   {:db/cardinality :db.cardinality/many}})
+   :alias   {:db/cardinality :db.cardinality/many}
+   :name    {}
+   :last-name {}
+   :age {}
+   :sex {:db.valueType :db.type/keyword}})
 
 (def empty-db (d/empty-db schema))
 
@@ -104,6 +108,19 @@
                   [?e :age ?a]
                   [?e :sex :male]]
       @*db100k)))
+
+(defn bench-q4-custom [] ;; (avg 40 runs: 3.164)
+  (bench/bench
+      (d/q '[:find ?e ?last-name ?a
+             :in $ ?e ?name ?last-name
+           :where [?e :name ?name]
+                  [?e :last-name ?last-name]
+                  [?e :age ?a]
+                  [?e :sex :male]]
+           @*db100k
+           13585
+           "Ivan"
+           "Kovalev")))
 
 ;; with changes: (avg 40 runs: 3.124)
 ;; 3.09

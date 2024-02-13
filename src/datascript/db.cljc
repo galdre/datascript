@@ -617,7 +617,8 @@
 ;;;;;;;;;; Searching
 
 (defprotocol ISearch
-  (-search [data pattern]))
+  (-search [data pattern])
+  (-batch-search [data batch-pattern pattern tuples]))
 
 (defn- ^Datom fsearch [data pattern]
   (first (-search data pattern)))
@@ -662,6 +663,9 @@
         (nil? v)     (fn [x] (nil? x))
         :else        (fn [x] (= v x)))))
 
+(declare batch-search)
+(declare search*)
+
 (defrecord-updatable DB [schema eavt aevt avet max-eid max-tx rschema pull-patterns pull-attrs hash]
   #?@(:cljs
       [IHash                (-hash  [db]        (hash-db db))
@@ -705,59 +709,10 @@
 
   ISearch
   (-search [db pattern]
-    (let [[e a v tx] pattern
-          eavt       (.-eavt db)
-          aevt       (.-aevt db)
-          avet       (.-avet db)
-          pred       #?(:clj  (vpred v)
-                        :cljs #(= v %))
-          multival?  (contains? (-attrs-by db :db.cardinality/many) a)]
-      (case-tree [e a (some? v) tx]
-        [(set/slice eavt (datom e a v tx) (datom e a v tx))                   ;; e a v tx
-         (set/slice eavt (datom e a v tx0) (datom e a v txmax))               ;; e a v _
-         (->> (set/slice eavt (datom e a nil tx0) (datom e a nil txmax))      ;; e a _ tx
-           (->Eduction (filter (fn [^Datom d] (= tx (datom-tx d))))))
-         (set/slice eavt (datom e a nil tx0) (datom e a nil txmax))           ;; e a _ _
-         (->> (set/slice eavt (datom e nil nil tx0) (datom e nil nil txmax))  ;; e _ v tx
-           (->Eduction (filter (fn [^Datom d] (and (pred (.-v d))
-                                                   (= tx (datom-tx d)))))))
-         (->> (set/slice eavt (datom e nil nil tx0) (datom e nil nil txmax))  ;; e _ v _
-           (->Eduction (filter (fn [^Datom d] (pred (.-v d))))))
-         (->> (set/slice eavt (datom e nil nil tx0) (datom e nil nil txmax))  ;; e _ _ tx
-           (->Eduction (filter (fn [^Datom d] (= tx (datom-tx d))))))
-         (set/slice eavt (datom e nil nil tx0) (datom e nil nil txmax))       ;; e _ _ _
-         (if (indexing? db a)                                                 ;; _ a v tx
-           (->> (set/slice avet (datom e0 a v tx0) (datom emax a v txmax))      
-             (->Eduction (filter (fn [^Datom d] (= tx (datom-tx d))))))
-           (->> (set/slice aevt (datom e0 a nil tx0) (datom emax a nil txmax))
-             (->Eduction (filter (fn [^Datom d] (and (pred (.-v d))
-                                                     (= tx (datom-tx d))))))))
-         (if (indexing? db a)                                                 ;; _ a v _
-           (set/slice avet (datom e0 a v tx0) (datom emax a v txmax))
-           (->> (set/slice aevt (datom e0 a nil tx0) (datom emax a nil txmax))
-             (->Eduction (filter (fn [^Datom d] (pred (.-v d)))))))
-         (->> (set/slice aevt (datom e0 a nil tx0) (datom emax a nil txmax))  ;; _ a _ tx
-           (->Eduction (filter (fn [^Datom d] (= tx (datom-tx d))))))
-         (set/slice aevt (datom e0 a nil tx0) (datom emax a nil txmax))       ;; _ a _ _
-         (filter (fn [^Datom d] (and (pred (.-v d))
-                                  (= tx (datom-tx d)))) eavt)                 ;; _ _ v tx
-         (filter (fn [^Datom d] (pred (.-v d))) eavt)                         ;; _ _ v 
-         (filter (fn [^Datom d] (= tx (datom-tx d))) eavt)                    ;; _ _ _ tx
-         eavt])))                                                             ;; _ _ _ _
-  #_(-batch-search [db tuples]
-    (let [exemplar (first tuples)
-          bound (boundedness exemplar)]))
-  #_(-multi-select-datoms-ordered [db [index-name tuples]]
-    (let [;; comment
-          ;; This is the multi-slice. It assumes the tuples are already
-          ;; prepared for the range query.
-          ;; All call sites will need to know how to pad
-          ;; with emax, tmax, and nil.
-          ;; Also need to make sure eva doesn't hardcode an index
-          ;; that doesn't exist in datascript
-          ]
-      ))
-
+    (search* db pattern))
+  (-batch-search [db batch-pattern pattern tuples]
+    (batch-search db batch-pattern pattern tuples))
+  
   IIndexAccess
   (-datoms [db index c0 c1 c2 c3]
     (validate-indexed db index c0 c1 c2 c3)
@@ -790,6 +745,99 @@
   clojure.data/Diff
   (diff-similar [a b]
     (diff-sorted (:eavt a) (:eavt b) cmp-datoms-eav-quick)))
+
+(defn search* [^DB db pattern]
+  (let [[e a v tx] pattern
+          eavt       (.-eavt db)
+          aevt       (.-aevt db)
+          avet       (.-avet db)
+          pred       #?(:clj  (vpred v)
+                        :cljs #(= v %))
+          multival?  (contains? (-attrs-by db :db.cardinality/many) a)]
+      (case-tree [e a (some? v) tx]
+        [(set/slice eavt (datom e a v tx) (datom e a v tx))  ;; e a v tx
+         (set/slice eavt (datom e a v tx0) (datom e a v txmax)) ;; e a v _
+         (->> (set/slice eavt (datom e a nil tx0) (datom e a nil txmax))      ;; e a _ tx
+           (->Eduction (filter (fn [^Datom d] (= tx (datom-tx d))))))
+         (set/slice eavt (datom e a nil tx0) (datom e a nil txmax)) ;; e a _ _
+         (->> (set/slice eavt (datom e nil nil tx0) (datom e nil nil txmax))  ;; e _ v tx
+           (->Eduction (filter (fn [^Datom d] (and (pred (.-v d))
+                                                   (= tx (datom-tx d)))))))
+         (->> (set/slice eavt (datom e nil nil tx0) (datom e nil nil txmax))  ;; e _ v _
+           (->Eduction (filter (fn [^Datom d] (pred (.-v d))))))
+         (->> (set/slice eavt (datom e nil nil tx0) (datom e nil nil txmax))  ;; e _ _ tx
+           (->Eduction (filter (fn [^Datom d] (= tx (datom-tx d))))))
+         (set/slice eavt (datom e nil nil tx0) (datom e nil nil txmax)) ;; e _ _ _
+         (if (indexing? db a)                                                 ;; _ a v tx
+           (->> (set/slice avet (datom e0 a v tx0) (datom emax a v txmax))      
+             (->Eduction (filter (fn [^Datom d] (= tx (datom-tx d))))))
+           (->> (set/slice aevt (datom e0 a nil tx0) (datom emax a nil txmax))
+             (->Eduction (filter (fn [^Datom d] (and (pred (.-v d))
+                                                     (= tx (datom-tx d))))))))
+         (if (indexing? db a)                                                 ;; _ a v _
+           (set/slice avet (datom e0 a v tx0) (datom emax a v txmax))
+           (->> (set/slice aevt (datom e0 a nil tx0) (datom emax a nil txmax))
+             (->Eduction (filter (fn [^Datom d] (pred (.-v d)))))))
+         (->> (set/slice aevt (datom e0 a nil tx0) (datom emax a nil txmax))  ;; _ a _ tx
+           (->Eduction (filter (fn [^Datom d] (= tx (datom-tx d))))))
+         (set/slice aevt (datom e0 a nil tx0) (datom emax a nil txmax)) ;; _ a _ _
+         (filter (fn [^Datom d] (and (pred (.-v d))
+                                  (= tx (datom-tx d)))) eavt)                 ;; _ _ v tx
+         (filter (fn [^Datom d] (pred (.-v d))) eavt)                         ;; _ _ v 
+         (filter (fn [^Datom d] (= tx (datom-tx d))) eavt)                    ;; _ _ _ tx
+         eavt])))
+
+(defn batch-search [^DB db batch-pattern fallback-pattern tuples]
+  (let [[e' a' v' tx'] batch-pattern
+        eavt       (.-eavt db)
+        aevt       (.-aevt db)
+        avet       (.-avet db)]
+    (case-tree [e' a' (some? v') tx']
+     [(let [;; _ (println "e a v tx")
+            ->range (fn [[e a v tx :as tuple]] ; e a v tx
+                      (set/->range-2 (datom e a v tx) (datom e a v tx)))
+            ranges (map ->range tuples)]
+        (set/batch-slice-2 eavt ranges))
+      (let [;; _ (println "e a v _")
+            ->range (fn [[e a v :as tuple]] ; e a v _
+                      (set/->range-2 (datom e a v tx0) (datom e a v txmax)))
+            ranges (map ->range tuples)]
+        (set/batch-slice-2 eavt ranges))
+      (-search db fallback-pattern) ; e a _ tx
+      (let [;; _ (println "e a _ _")
+            ->range (fn [[e a :as tuple]] ; e a _ _
+                      (set/->range-2 (datom e a nil tx0) (datom e a nil txmax)))
+            ranges (map ->range tuples)]
+        (set/batch-slice-2 eavt ranges))
+      (-search db fallback-pattern) ; e _ v tx
+      (-search db fallback-pattern) ; e _ v _
+      (-search db fallback-pattern) ; e _ _ tx
+      (let [;; _ (println "e _ _ _")
+            ->range (fn [[e :as tuple]] ; e _ _ _
+                      (set/->range-2 (datom e nil nil tx0) (datom e nil nil txmax)))
+            ranges (map ->range tuples)]
+        (set/batch-slice-2 eavt ranges))
+      (-search db fallback-pattern) ;; TODO: _ a v tx
+      (let [all-a (into #{} (map second) tuples)  ; _ a v _
+            fall-back? (some #(not (indexing? db %)) all-a)]
+        (if fall-back?
+          (-search db fallback-pattern) ; unfortunately!
+          (let [;; _ (println "_ a v _")
+                ->range (fn [[_e a v :as tuple]]
+                          (set/->range-2 (datom e0 a v tx0)
+                                         (datom emax a v txmax)))
+                ranges (map ->range tuples)]
+            (set/batch-slice-2 avet ranges))))
+      (-search db fallback-pattern) ; _ a _ tx
+      (let [;; _ (println "_ a _ _")
+            ->range (fn [[_e a :as tuple]] ; _ a _ _
+                      (set/->range-2 (datom e0 a nil tx0) (datom emax a nil txmax)))
+            ranges (map ->range tuples)]
+        (set/batch-slice-2 aevt ranges))
+      (-search db fallback-pattern) ; _ _ v tx
+      (-search db fallback-pattern) ; _ _ v _
+      (-search db fallback-pattern) ; _ _ _ tx
+      eavt])))
 
 (defn db? [x]
   #?(:clj
