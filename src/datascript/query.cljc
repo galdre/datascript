@@ -41,12 +41,21 @@
 ;; or [(Datom. 2 "Oleg" 1 55) ...]
 (defrecord Relation [attrs tuples])
 
+;; TODO: document
+(defrecord NeededVars [global local branches])
+
+(letfn [(all-vars []
+          (->NeededVars (constantly true)
+                        (constantly true)
+                        (repeatedly all-vars)))]
+  (def ALL-VARS (all-vars)))
 
 ;; Utilities
 
-(defn intersect-keys [attrs1 attrs2]
-  (set/intersection (set (keys attrs1))
-    (set (keys attrs2))))
+(defn intersect-keys
+  ([attrs1 attrs2]
+   (set/intersection (set (keys attrs1))
+                     (set (keys attrs2)))))
 
 (defn same-keys? [a b]
   (and (= (count a) (count b))
@@ -99,14 +108,23 @@
                       t2 ^{:tag "[[Ljava.lang.Object;"} idxs2]
      (let [l1  (alength idxs1)
            l2  (alength idxs2)
-           res (da/make-array (+ l1 l2))]
-       (if (.isArray (.getClass ^Object t1))
-         (dotimes [i l1] (aset res i (aget ^objects t1 (aget idxs1 i))))
-         (dotimes [i l1] (aset res i (get t1 (aget idxs1 i)))))
-       (if (.isArray (.getClass ^Object t2))
-         (dotimes [i l2] (aset res (+ l1 i) (get ^objects t2 (aget idxs2 i))))
-         (dotimes [i l2] (aset res (+ l1 i) (get t2 (aget idxs2 i)))))
-       res))
+           t1-accessor (if (.isArray (.getClass ^Object t1))
+                         #(aget ^objects t1 %)
+                         #(get t1 %))
+           t2-accessor (if (.isArray (.getClass ^Object t2))
+                         #(aget ^objects t2 %)
+                         #(get t2 %))
+           res (reduce
+                (fn [r i]
+                  (conj! r (t1-accessor (aget idxs1 i))))
+                (transient [])
+                (range l1))
+           res (reduce
+                (fn [r i]
+                  (conj! r (t2-accessor (aget idxs2 i))))
+                res
+                (range l2))]
+       (persistent! res)))
    :cljs
    (defn join-tuples [t1 idxs1
                       t2 idxs2]
@@ -333,38 +351,39 @@
 (defn hash-attrs [key-fn tuples]
   (-group-by key-fn '() tuples))
 
-(defn hash-join [rel1 rel2]
+(defn hash-join [rel1 rel2 needed-vars]
   (let [tuples1       (:tuples rel1)
         tuples2       (:tuples rel2)
         attrs1        (:attrs rel1)
         attrs2        (:attrs rel2)
-        common-attrs  (vec (intersect-keys (:attrs rel1) (:attrs rel2)))
-        keep-attrs1   (keys attrs1)
+        common-attrs  (vec (intersect-keys attrs1 attrs2))
+        all-needed    (:global needed-vars)
+        keep-attrs1   (filter all-needed (keys attrs1))
         keep-attrs2   (->> attrs2
-                        (reduce-kv (fn keeper [vec k _]
-                                     (if (attrs1 k)
-                                       vec
-                                       (conj! vec k)))
-                          (transient []))
-                        persistent!) ; keys in attrs2-attrs1
-        keep-idxs1    (to-array (vals attrs1))
+                           (reduce-kv (fn keeper [vec k _]
+                                        (if (or (attrs1 k) (not (all-needed k)))
+                                          vec
+                                          (conj! vec k)))
+                                      (transient []))
+                           persistent!)
+        keep-idxs1    (to-array (map attrs1 keep-attrs1))
         keep-idxs2    (to-array (->Eduction (map attrs2) keep-attrs2)) ; vals in attrs2-attrs1 by keys
         key-fn1       (tuple-key-fn attrs1 common-attrs)
         key-fn2       (tuple-key-fn attrs2 common-attrs)
         hash          (hash-attrs key-fn1 tuples1)
         new-tuples    (->>
-                        tuples2
-                        (reduce (fn outer [acc tuple2]
-                                  (let [key (key-fn2 tuple2)]
-                                    (if-some [tuples1 #?(:clj (hash key) :cljs (get hash key))]
-                                      (reduce (fn inner [acc tuple1]
-                                                (conj! acc (join-tuples tuple1 keep-idxs1 tuple2 keep-idxs2)))
-                                        acc tuples1)
-                                      acc)))
-                          (transient []))
-                        (persistent!))]
+                       tuples2
+                       (reduce (fn outer [acc tuple2]
+                                 (let [key (key-fn2 tuple2)]
+                                   (if-some [tuples1 #?(:clj (hash key) :cljs (get hash key))]
+                                     (reduce (fn inner [acc tuple1]
+                                               (conj! acc (join-tuples tuple1 keep-idxs1 tuple2 keep-idxs2)))
+                                             acc tuples1)
+                                     acc)))
+                               (transient #{}))
+                       (persistent!))]
     (Relation. (zipmap (concat keep-attrs1 keep-attrs2) (range))
-      new-tuples)))
+               new-tuples)))
 
 (defn subtract-rel [a b]
   (let [{attrs-a :attrs, tuples-a :tuples} a
@@ -445,13 +464,13 @@
     (lookup-pattern-db context source pattern)
     (lookup-pattern-coll context source pattern)))
 
-(defn collapse-rels [rels new-rel]
+(defn collapse-rels [rels new-rel needed-vars]
   (loop [rels    rels
          new-rel new-rel
          acc     []]
     (if-some [rel (first rels)]
       (if (not-empty (intersect-keys (:attrs new-rel) (:attrs rel)))
-        (recur (next rels) (hash-join rel new-rel) acc)
+        (recur (next rels) (hash-join rel new-rel needed-vars) acc)
         (recur (next rels) new-rel (conj acc rel)))
       (conj acc new-rel))))
 
@@ -521,15 +540,15 @@
                        (assoc production :tuples []))]
     (update context :rels conj new-rel)))
 
-(defn bind-by-fn [context clause]
+(defn bind-by-fn [context clause needed-vars]
   (let [[[f & args] out] clause
         binding  (dp/parse-binding out)
         fun      (or (get built-ins/query-fns f)
-                   (context-resolve-val context f)
-                   (resolve-sym f)
-                   (when (nil? (rel-with-attr context f))
-                     (util/raise "Unknown function '" f " in " clause
-                       {:error :query/where, :form clause, :var f})))
+                     (context-resolve-val context f)
+                     (resolve-sym f)
+                     (when (nil? (rel-with-attr context f))
+                       (util/raise "Unknown function '" f " in " clause
+                                   {:error :query/where, :form clause, :var f})))
         [context production] (rel-prod-by-attrs context (filter symbol? args))
         new-rel  (if fun
                    (let [tuple-fn (-call-fn context production fun args)
@@ -537,12 +556,12 @@
                                         :let  [val (tuple-fn tuple)]
                                         :when (not (nil? val))]
                                     (prod-rel (Relation. (:attrs production) [tuple])
-                                      (in->rel binding val)))]
+                                              (in->rel binding val)))]
                      (if (empty? rels)
                        (prod-rel production (empty-rel binding))
                        (reduce sum-rel rels)))
                    (prod-rel (assoc production :tuples []) (empty-rel binding)))]
-    (update context :rels collapse-rels new-rel)))
+    (update context :rels #(collapse-rels % %2 needed-vars) new-rel)))
 
 ;;; RULES
 
@@ -615,12 +634,12 @@
     [(filter pred guards)
      (remove pred guards)]))
 
-(defn solve-rule [context clause]
+(defn solve-rule [context clause needed-vars]
   (let [final-attrs     (filter free-var? clause)
         final-attrs-map (zipmap final-attrs (range))
         ;;         clause-cache    (atom {}) ;; TODO
         solve           (fn [prefix-context clauses]
-                          (reduce -resolve-clause prefix-context clauses))
+                          (reduce #(-resolve-clause % %2 ALL-VARS) prefix-context clauses))
         empty-rels?     (fn [context]
                           (some #(empty? (:tuples %)) (:rels context)))]
     (loop [stack (list {:prefix-clauses []
@@ -643,7 +662,7 @@
             (let [[rule & call-args]     rule-clause
                   guards                 (rule-gen-guards rule-clause (:used-args frame))
                   [active-gs pending-gs] (split-guards (concat (:prefix-clauses frame) clauses)
-                                           (concat guards (:pending-guards frame)))]
+                                                       (concat guards (:pending-guards frame)))]
               (if (some #(= % '[(-differ?)]) active-gs) ;; trivial always false case like [(not= [?a ?b] [?a ?b])]
 
                 ;; this branch has no data, just drop it from stack
@@ -658,17 +677,17 @@
 
                     ;; need to expand rule to branches
                     (let [used-args  (assoc (:used-args frame) rule
-                                       (conj (get (:used-args frame) rule []) call-args))
+                                            (conj (get (:used-args frame) rule []) call-args))
                           branches   (expand-rule rule-clause context used-args)]
                       (recur (concat
-                               (for [branch branches]
-                                 {:prefix-clauses prefix-clauses
-                                  :prefix-context prefix-context
-                                  :clauses        (util/concatv branch next-clauses)
-                                  :used-args      used-args
-                                  :pending-guards pending-gs})
-                               (next stack))
-                        rel))))))))
+                              (for [branch branches]
+                                {:prefix-clauses prefix-clauses
+                                 :prefix-context prefix-context
+                                 :clauses        (util/concatv branch next-clauses)
+                                 :used-args      used-args
+                                 :pending-guards pending-gs})
+                              (next stack))
+                             rel))))))))
         rel))))
 
 (defn dynamic-lookup-attrs [source pattern]
@@ -687,8 +706,8 @@
 
 (defn limit-context [context vars]
   (assoc context
-    :rels (->> (:rels context)
-            (keep #(limit-rel % vars)))))
+         :rels (->> (:rels context)
+                    (keep #(limit-rel % vars)))))
 
 (defn bound-vars [context]
   (into #{} (mapcat #(keys (:attrs %)) (:rels context))))
@@ -720,81 +739,114 @@
            :vars  missing})))))
 
 (defn -resolve-clause
-  ([context clause]
-   (-resolve-clause context clause clause))
-  ([context clause orig-clause]
+  ([context clause needed-vars]
+   (-resolve-clause context clause clause needed-vars))
+  ([context clause orig-clause needed-vars]
    (condp looks-like? clause
      [[symbol? '*]] ;; predicate [(pred ?a ?b ?c)]
      (do
        (check-bound (bound-vars context) (filter free-var? (nfirst clause)) clause)
-       (filter-by-pred context clause))
-     
+       (filter-by-pred context clause)) ; needed-vars?
+
      [[symbol? '*] '_] ;; function [(fn ?a ?b) ?res]
      (do
        (check-bound (bound-vars context) (filter free-var? (nfirst clause)) clause)
-       (bind-by-fn context clause))
-     
+       (bind-by-fn context clause needed-vars))
+
      [source? '*] ;; source + anything
      (let [[source-sym & rest] clause]
        (binding [*implicit-source* (get (:sources context) source-sym)]
-         (-resolve-clause context rest clause)))
-     
+         (-resolve-clause context rest clause needed-vars)))
+
      '[or *] ;; (or ...)
      (let [[_ & branches] clause
            _        (check-free-same (bound-vars context) branches clause)
-           contexts (map #(resolve-clause context %) branches)
-           rels     (map #(reduce hash-join (:rels %)) contexts)]
+           contexts (map #(resolve-clause context % %2)
+                         branches
+                         (:branches needed-vars))
+           rels     (map #(reduce (fn [rel1 rel2]
+                                    ;; forcing a collapse. Only has effect if attrs are entirely disjoint.
+                                    ;; So let's ensure we limit to vars needed *after* or-clause runs.
+                                    (hash-join rel1 rel2 needed-vars))
+                                  (:rels %))
+                         contexts)]
        (assoc (first contexts) :rels [(reduce sum-rel rels)]))
-     
+
      '[or-join [[*] *] *] ;; (or-join [[req-vars] vars] ...)
      (let [[_ [req-vars & vars] & branches] clause
            bound (bound-vars context)]
        (check-bound bound req-vars orig-clause)
        (check-free-subset bound vars branches)
-       (recur context (list* 'or-join (concat req-vars vars) branches) clause))
-     
+       (recur context (list* 'or-join (concat req-vars vars) branches) clause needed-vars))
+
      '[or-join [*] *] ;; (or-join [vars] ...)
      (let [[_ vars & branches] clause
-           vars         (set vars)
-           _            (check-free-subset (bound-vars context) vars branches)
-           join-context (limit-context context vars)
-           contexts     (map #(-> join-context (resolve-clause %) (limit-context vars)) branches)
-           rels         (map #(reduce hash-join (:rels %)) contexts)
+           vars-set    (set vars)
+           _           (check-free-subset (bound-vars context) vars branches)
+           join-context (limit-context context vars-set)
+           contexts     (map
+                         (fn [branch branch-needed-vars]
+                           (-> join-context
+                               (resolve-clause branch branch-needed-vars)
+                               ;; Limit as aggressively as we can:
+                               (limit-context (:global needed-vars))))
+                         branches
+                         (:branches needed-vars))
+           rels         (map #(reduce (fn [rel1 rel2]
+                                        (hash-join rel1 rel2 needed-vars))
+                                      (:rels %))
+                             contexts)
            sum-rel      (reduce sum-rel rels)]
-       (update context :rels collapse-rels sum-rel))
-     
+       (update context :rels #(collapse-rels % %2 needed-vars) sum-rel))
+
      '[and *] ;; (and ...)
      (let [[_ & clauses] clause]
-       (reduce resolve-clause context clauses))
-     
+       (reduce (fn [ctx [c branch-needed]]
+                 (resolve-clause ctx c branch-needed))
+               context
+               (map vector clauses (:branches needed-vars))))
+
      '[not *] ;; (not ...)
      (let [[_ & clauses] clause
            bound            (bound-vars context)
            negation-vars    (collect-vars clauses)
            _                (when (empty? (set/intersection bound negation-vars))
                               (util/raise "Insufficient bindings: none of " negation-vars " is bound in " orig-clause
-                                {:error :query/where
-                                 :form  orig-clause}))
-           context'         (assoc context :rels [(reduce hash-join (:rels context))])
-           negation-context (reduce resolve-clause context' clauses)
+                                          {:error :query/where
+                                           :form  orig-clause}))
+           context'         (assoc context :rels [(reduce (fn [rel1 rel2]
+                                                            (hash-join rel1 rel2 needed-vars))
+                                                          (:rels context))])
+           negation-context (reduce (fn [ctx [c branch-needed-vars]]
+                                      (resolve-clause ctx c branch-needed-vars))
+                                    context'
+                                    (map vector clauses (:branches needed-vars)))
            negation         (subtract-rel
-                              (util/single (:rels context'))
-                              (reduce hash-join (:rels negation-context)))]
+                             (util/single (:rels context'))
+                             (reduce (fn [rel1 rel2]
+                                       (hash-join rel1 rel2 needed-vars))
+                                     (:rels negation-context)))]
        (assoc context' :rels [negation]))
-     
+
      '[not-join [*] *] ;; (not-join [vars] ...)
      (let [[_ vars & clauses] clause
            bound            (bound-vars context)
            _                (check-bound bound vars orig-clause)
-           context'         (assoc context :rels [(reduce hash-join (:rels context))])
+           context'         (assoc context :rels [(reduce (fn [rel1 rel2]
+                                                            (hash-join rel1 rel2 needed-vars))
+                                                          (:rels context))])
            join-context     (limit-context context' vars)
-           negation-context (-> (reduce resolve-clause join-context clauses)
-                              (limit-context vars))
+           negation-context (reduce (fn [ctx [c needed]]
+                                      (resolve-clause ctx c needed))
+                                    join-context
+                                    (map vector clauses (:branches needed-vars)))
            negation         (subtract-rel
-                              (util/single (:rels context'))
-                              (reduce hash-join (:rels negation-context)))]
+                             (util/single (:rels context'))
+                             (reduce (fn [rel1 rel2]
+                                       (hash-join rel1 rel2 needed-vars))
+                                     (:rels negation-context)))]
        (assoc context' :rels [negation]))
-     
+
      '[*] ;; pattern
      (let [source   *implicit-source*
            pattern' (resolve-pattern-lookup-refs source clause)
@@ -802,49 +854,182 @@
        (binding [*lookup-attrs* (if (satisfies? db/IDB source)
                                   (dynamic-lookup-attrs source pattern')
                                   *lookup-attrs*)]
-         (update context :rels collapse-rels relation))))))
+         (update context :rels #(collapse-rels % %2 needed-vars) relation))))))
 
-(defn resolve-clause [context clause]
+(defn- -resolve-clause-impl [context clause needed-vars]
+  (let [context' (if (rule? context clause)
+                   (if (source? (first clause))
+                     (binding [*implicit-source* (get (:sources context) (first clause))]
+                       (-resolve-clause-impl context (next clause) needed-vars))
+                     (update context :rels #(collapse-rels % %2 needed-vars) (solve-rule context clause needed-vars)))
+                   (-resolve-clause context clause needed-vars))]
+    context'))
+
+(defn resolve-clause [context clause needed-vars]
   (if (->> (:rels context) (some (comp empty? :tuples)))
     context ; The result is empty; short-circuit processing
-    (if (rule? context clause)
-      (if (source? (first clause))
-        (binding [*implicit-source* (get (:sources context) (first clause))]
-          (resolve-clause context (next clause)))
-        (update context :rels collapse-rels (solve-rule context clause)))
-      (-resolve-clause context clause))))
+    (-resolve-clause-impl context clause needed-vars)))
+
+(declare pre-compute-needed-vars)
+
+;; 1. Each element in the sequence needs:
+;;  a. The vars needed after the clause is complete
+;;  b. The exact same structure for its branch clauses (if any)
+;;
+;; The "last" clause in any scope has its own branches
+;; but its "needed vars" is equal to the parent scope.
+;;
+;; The initial "parent scope" is the set of find-vars
+;; gathered from :find and :with clauses.
+
+(defn- collect-clause-vars
+  [vars-to-keep clause]
+  (let [pre-compute-branches (partial pre-compute-needed-vars vars-to-keep)]
+    (condp looks-like? clause
+      [[symbol? '*]] ;; predicate [(pred ?a ?b ?c)]
+      (let [[pred & args] (first clause)]
+        (->NeededVars
+         vars-to-keep
+         (into (if (and (symbol? pred) (= \? (first (name pred))))
+                 #{pred}
+                 #{})
+               (filter #(and (symbol? %)
+                             (= \? (first (name %)))))
+               args)
+         []))
+
+      [[symbol? '*] '_] ;; function [(fn ?a ?b) ?res]
+      (let [[[pred & args] result] clause]
+        (->NeededVars
+         vars-to-keep
+         (into (if (and (symbol? pred) (= \? (first (name pred))))
+                 #{pred}
+                 #{})
+               (filter #(and (symbol? %)
+                             (= \? (first (name %)))))
+               (concat args [result]))
+         []))
+
+      [source? '*] ;; source + anything
+      (recur vars-to-keep (rest clause))
+
+      '[or *] ;; (or ...)
+      (let [branch-vars (map (partial collect-clause-vars vars-to-keep)
+                             (rest clause))]
+        (->NeededVars
+         vars-to-keep
+         ;; All vars used in any `or` branch will unify with larger context:
+         (into #{} (mapcat :local) branch-vars)
+         branch-vars))
+
+      '[or-join [[*] *] *] ;; (or-join [[req-vars] vars] ...)
+      (let [[_ [req-vars & vars] & branches] clause
+            ;; We don't want to unify any vars but these:
+            scoped-vars-to-keep (into (set req-vars) vars)
+            branch-vars (map (partial collect-clause-vars scoped-vars-to-keep) branches)]
+        (->NeededVars
+         vars-to-keep ; used to limit results after running
+         scoped-vars-to-keep ; used to compute all of this
+         branch-vars))
+
+      '[or-join [*] *] ;; (or-join [vars] ...)
+      (let [[_ vars & branches] clause
+            ;; We don't want to unify any vars but these:
+            scoped-vars-to-keep (set vars)
+            branch-vars (map (partial collect-clause-vars scoped-vars-to-keep) branches)]
+        (->NeededVars
+         vars-to-keep
+         scoped-vars-to-keep
+         branch-vars))
+
+      '[and *] ;; (and ...)
+      (let [branch-vars (pre-compute-branches (rest clause))] ; conjunctive
+        (->NeededVars
+         vars-to-keep
+         ;; will be used when it's in an `or`?
+         (into #{} (mapcat :local) branch-vars)
+         branch-vars))
+
+      '[not *] ;; (not ...)
+      (let [branch-vars (pre-compute-branches (rest clause))]
+        (->NeededVars
+         vars-to-keep
+         ;; We want to unify all vars with larger context:
+         (into #{} (mapcat :local) branch-vars)
+         branch-vars))
+
+      '[not-join [*] *] ;; (not-join [vars] ...)
+      (let [[_ vars & branches] clause
+            scoped-vars-to-keep (set vars)
+            branch-vars (pre-compute-needed-vars scoped-vars-to-keep branches)]
+        (->NeededVars
+         vars-to-keep
+         scoped-vars-to-keep
+         branch-vars))
+
+      '[*] ;; pattern
+      (do
+        (->NeededVars
+         vars-to-keep
+         (into #{}
+               (filter #(and (symbol? %)
+                             (= \? (first (name %)))))
+               clause)
+         [])))))
+
+(defn pre-compute-needed-vars [parent-scope clauses]
+  (loop [remaining-clauses (reverse clauses)
+         ;; The vars we need to keep once this clause has finished:
+         vars-needed parent-scope
+         result []]
+    (if (empty? remaining-clauses)
+      (reverse result)
+      (let [clause (first remaining-clauses)
+            clause-vars (collect-clause-vars vars-needed clause)]
+        (recur
+         (rest remaining-clauses)
+         (into vars-needed (:local clause-vars))
+         (conj result clause-vars))))))
 
 (defn -q [context clauses]
-  (binding [*implicit-source* (get (:sources context) '$)]
-    (reduce resolve-clause context clauses)))
+  (let [needed-vars-seq (pre-compute-needed-vars (:final-vars context) clauses)]
+    (binding [*implicit-source* (get (:sources context) '$)]
+      (loop [context (dissoc context :final-vars)
+             [clause & remaining-clauses] clauses
+             [needed-vars & next-needed-vars] needed-vars-seq]
+        (if-not clause
+          context
+          (recur (resolve-clause context clause needed-vars)
+                   remaining-clauses
+                   next-needed-vars))))))
 
 (defn -collect-tuples
   [acc rel ^long len copy-map]
   (->Eduction
-    (comp
-      (map
-        (fn [#?(:cljs t1
-                :clj ^{:tag "[[Ljava.lang.Object;"} t1)]
-          (->Eduction
-            (map
-              (fn [t2]
-                (let [res (aclone t1)]
-                  #?(:clj
-                     (if (.isArray (.getClass ^Object t2))
-                       (dotimes [i len]
-                         (when-some [idx (aget ^objects copy-map i)]
-                           (aset res i (aget ^objects t2 idx))))
-                       (dotimes [i len]
-                         (when-some [idx (aget ^objects copy-map i)]
-                           (aset res i (get t2 idx)))))
-                     :cljs
-                     (dotimes [i len]
-                       (when-some [idx (aget ^objects copy-map i)]
-                         (aset res i (da/aget ^objects t2 idx)))))
-                  res)))
-            (:tuples rel))))
-      cat)
-    acc))
+   (comp
+    (map
+     (fn [#?(:cljs t1
+             :clj ^{:tag "[[Ljava.lang.Object;"} t1)]
+       (->Eduction
+        (map
+         (fn [t2]
+           (let [res (aclone t1)]
+             #?(:clj
+                (if (.isArray (.getClass ^Object t2))
+                  (dotimes [i len]
+                    (when-some [idx (aget ^objects copy-map i)]
+                      (aset res i (aget ^objects t2 idx))))
+                  (dotimes [i len]
+                    (when-some [idx (aget ^objects copy-map i)]
+                      (aset res i (get t2 idx)))))
+                :cljs
+                (dotimes [i len]
+                  (when-some [idx (aget ^objects copy-map i)]
+                    (aset res i (da/aget ^objects t2 idx)))))
+             res)))
+        (:tuples rel))))
+    cat)
+   acc))
 
 (defn -collect
   ([context symbols]
@@ -979,16 +1164,17 @@
                         (sequential? q) dp/query->map)
         wheres        (:where q)
         context       (-> (Context. [] {} {})
-                        (resolve-ins (:qin parsed-q) inputs))
+                          (resolve-ins (:qin parsed-q) inputs)
+                          (assoc :final-vars (set all-vars)))
         resultset     (-> context
-                        (-q wheres)
-                        (collect all-vars))]
+                          (-q wheres)
+                          (collect all-vars))]
     (cond->> resultset
       (:with q)
       (mapv #(vec (subvec % 0 result-arity)))
       (some dp/aggregate? find-elements)
       (aggregate find-elements context)
       (some dp/pull? find-elements)
-      (pull find-elements context)
+     (pull find-elements context)
       true
       (-post-process find (:qreturn-map parsed-q)))))

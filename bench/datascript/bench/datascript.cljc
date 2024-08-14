@@ -108,6 +108,30 @@
                   [?e :last-name ?l]
                   [?e :age ?a]
                   [?e :sex :male]]
+         @*db100k)))
+
+(defn bench-q6 []
+  (bench/bench
+    (d/q '[:find ?e ?last-name
+           :where
+           [?e :name ?name]
+           [?e2 :name ?name]
+           [?e2 :last-name ?last-name]
+           [?e3 :last-name]
+           #_[?e3 :last-name ?last-name]
+           #_[?e2 :age ?a]
+           #_[?e3 :age ?a]]
+         @*db100k)))
+
+(defn bench-q7 []
+  (bench/bench
+    (d/q '[:find ?e ?e3
+           :where
+           [?e :name "Ivan"]
+           [?e :age ?age]
+           [?e2 :age ?age]
+           [?e2 :last-name ?last-name]
+           [?e3 :last-name ?last-name]]
       @*db100k)))
 
 (defn bench-q5-shortcircuit []

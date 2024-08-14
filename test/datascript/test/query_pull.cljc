@@ -38,13 +38,14 @@
                                         :in   '[$ ?pattern]
                                         :where '[[?e :age ?a]
                                                  [(>= ?a 18)]]}
-                                    @*test-db pattern))
-                            res)
+                                       @*test-db pattern))
+                             res)
     '[(pull ?e ?pattern)] [:name]
     #{[{:name "Ivan"}] [{:name "Petr"}]}
-       
+
     '[?e ?a ?pattern (pull ?e ?pattern)] [:name]
-    #{[2 25 [:name] {:name "Ivan"}] [1 44 [:name] {:name "Petr"}]}))
+    #{[2 25 [:name] {:name "Ivan"}] [1 44 [:name] {:name "Petr"}]}
+    ))
 
 ;; not supported
 #_(deftest test-multi-pattern
